@@ -1,9 +1,11 @@
 import argparse
 import csv
-from datetime import datetime
-from typing import Union, Tuple, cast
+from datetime import datetime, timedelta
+from typing import Union, Tuple
+import line_profiler
 
 
+@line_profiler.profile
 def calculate_percent_profit(
     ask_prices: list[float], bid: int
 ) -> Tuple[float, Union[int, None]]:
@@ -14,18 +16,18 @@ def calculate_percent_profit(
     # negative: chain = exch_-x -> exch_-x-1 -> ... -> exch_-x-(n-1)
     max_profit_chain: Union[int, None] = None
 
-    for i, conversion in enumerate(ask_prices):
+    for i in range(num_exchanges):
         total_conversion_rate = 1
         for j in range(num_exchanges):
             comparison_conversion = ask_prices[(i + j) % num_exchanges]
             total_conversion_rate *= comparison_conversion
 
-        forwards_profit_percentage = total_conversion_rate
+        # forwards_profit_percentage = total_conversion_rate
         # ! assume that 1 / atob is approximately btoa
         backwards_profit_percentage = 1 / total_conversion_rate
 
-        if forwards_profit_percentage > max_profit_percentage:
-            max_profit_percentage = forwards_profit_percentage
+        if total_conversion_rate > max_profit_percentage:
+            max_profit_percentage = total_conversion_rate
             max_profit_chain = i + 1
 
         if backwards_profit_percentage > max_profit_percentage:
@@ -75,6 +77,19 @@ def get_flipped_exchanges(exchanges: list[str]) -> list[bool]:
     return flipped
 
 
+def get_date(date_str: str) -> datetime:
+    # dates are stored in yyyyMMdd hh:mm:ss
+    year = int(date_str[0:4])
+    month = int(date_str[4:6])
+    day = int(date_str[6:8])
+    hour = int(date_str[9:11])
+    minute = int(date_str[12:14])
+    second = float(date_str[15:])
+    microsecond = int((second % 1) * 1_000_000)
+    return datetime(year, month, day, hour, minute, int(second), microsecond)
+
+
+@line_profiler.profile
 def process(
     exchanges: list[str],
     flipped_exchanges: list[bool],
@@ -88,29 +103,14 @@ def process(
     try:
         readers = [csv.reader(f) for f in files]
 
-        lines = [f.readlines() for f in files]
-        first_lines = [lineset[0] if lineset else None for lineset in lines]
-        last_lines = [lineset[-1] if lineset else None for lineset in lines]
-
-        for file in files:
-            file.seek(0)
-
-        # if we don't delete lines here, it takes ~1.5gb/exch in ram
-        del lines
+        first_lines = [next(reader) for reader in readers]
 
         first_timestamps = [
-            datetime.strptime(line.split(",")[1], "%Y%m%d %H:%M:%S.%f")
-            for line in first_lines
-            if line is not None
-        ]
-        last_timestamps = [
-            datetime.strptime(line.split(",")[1], "%Y%m%d %H:%M:%S.%f")
-            for line in last_lines
-            if line is not None
+            get_date(line[1]) for line in first_lines if line is not None
         ]
 
         min_timestamp = min(first_timestamps)
-        max_timestamp = max(last_timestamps)
+        max_timestamp = min_timestamp + timedelta(hours=1)
 
         current_ask_prices: list[Union[float, None]] = [None] * len(exchanges)
         next_ask_price_timestamps: list[datetime] = first_timestamps.copy()
@@ -132,7 +132,7 @@ def process(
 
             try:
                 row = next(readers[next_timestamp_index])
-                ts = datetime.strptime(row[1], "%Y%m%d %H:%M:%S.%f")
+                ts = get_date(row[1])
 
                 if flipped_exchanges[next_timestamp_index]:
                     current_ask_prices[next_timestamp_index] = float(row[3])
@@ -154,9 +154,9 @@ def process(
                 if best_percent_profit > profit_threshold:
                     total_percent_profit += best_percent_profit
                     total_trades += 1
-                    print(
-                        f"Arbitrage opportunity found on {get_chain_from_id(exchanges, best_percent_profit_chain)} for {best_percent_profit}% profit"
-                    )
+                    # print(
+                    #     f"Arbitrage opportunity found on {get_chain_from_id(exchanges, best_percent_profit_chain)} for {best_percent_profit}% profit"
+                    # )
 
                 # sanity check:
                 # product = 1
