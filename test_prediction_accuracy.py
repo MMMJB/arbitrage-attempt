@@ -102,12 +102,14 @@ def simulate_prediction_accuracy(
                 num_downward = len(sliding_downward_timestamps)
                 prediction_timestamp = timestamp + (exchange_latency / 1000)
 
+                timestamp_object = datetime.fromtimestamp(timestamp)
+
                 # make prediction
                 predicted_spread = predict_spread(
                     current_spread=spread,
                     recent_narrow_count=num_downward,
                     recent_widen_count=num_upward,
-                    hour_of_day=_,
+                    hour_of_day=timestamp_object.hour,
                     projected_seconds=exchange_latency / 1000,
                 )
                 # add it to pending predictions
