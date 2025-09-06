@@ -5,53 +5,73 @@ from typing import Union
 import numpy as np
 
 
-def lambda_widen(recent_widen_count: int, recent_narrow_count: int, hour_of_day: int):
-    return np.exp(
-        0.2353
-        + 0.0905 * recent_widen_count
-        + 0.0275 * recent_narrow_count
-        + 0.0254 * hour_of_day
-    )
+def hawkes_lambda(
+    t: float, t_history: list[float], c_history: list[int], mu, alpha, beta
+):
+    t_history_as_array = np.asarray(t_history)
+    c_history_as_array = np.asarray(c_history)
+
+    lambda_t = mu.copy()
+    past_mask = t_history_as_array < t
+    t_past = t_history_as_array[past_mask]
+    c_past = c_history_as_array[past_mask]
+
+    if len(t_past) > 0:
+        for k in range(2):
+            for j in range(2):
+                type_j_events = t_past[c_past == j]
+                if len(type_j_events) > 0:
+                    dt = t - type_j_events
+                    excitation = alpha[k, j] * np.sum(np.exp(-beta[k, j] * dt))
+                    lambda_t[k] += excitation
+    return lambda_t
 
 
-def lambda_narrow(recent_widen_count: int, recent_narrow_count: int, hour_of_day: int):
-    return np.exp(
-        0.1345
-        + 0.0834 * recent_widen_count
-        + 0.0363 * recent_narrow_count
-        + 0.0220 * hour_of_day
-    )
-
-
-def predict_spread(
-    current_spread: float,
-    recent_widen_count: int,
-    recent_narrow_count: int,
-    hour_of_day: int,
+def predict_delta_spread(
+    current_time: float,
+    event_timestamps: list[float],
+    event_types: list[int],  # 0 = widen, 1 = narrow
     projected_seconds: float,
 ) -> float:
-    lambda_w = lambda_widen(recent_widen_count, recent_narrow_count, hour_of_day)
-    lambda_n = lambda_narrow(recent_widen_count, recent_narrow_count, hour_of_day)
-
-    p_widen = (1 - np.exp(-lambda_w * projected_seconds)) * np.exp(
-        -lambda_n * projected_seconds
-    )
-    p_narrow = (1 - np.exp(-lambda_n * projected_seconds)) * np.exp(
-        -lambda_w * projected_seconds
-    )
-
-    expected_value_delta_spread = (
-        p_widen * 1.3823143652012289e-05 - p_narrow * 1.4469175071553994e-05
+    current_lambda = hawkes_lambda(
+        current_time,
+        event_timestamps,
+        event_types,
+        mu=np.array([0.58841823, 0.70208766]),
+        alpha=np.array(
+            [[2.33355352e-05, 5.91376586e00], [1.17077446e01, 6.74719942e-01]]
+        ),
+        beta=np.array([[2.37373713e04, 7.99569438e00], [1.61963724e01, 4.47351193e01]]),
     )
 
-    return current_spread + expected_value_delta_spread
+    lambda_widen, lambda_narrow = current_lambda[0], current_lambda[1]
+    lambda_total = lambda_widen + lambda_narrow
+
+    if lambda_total > 0:
+        prob_any_event = 1 - np.exp(-lambda_total * projected_seconds)
+        prob_widen = (lambda_widen / lambda_total) * prob_any_event
+        prob_narrow = (lambda_narrow / lambda_total) * prob_any_event
+
+        # Expected change
+        expected_delta_spread = (
+            prob_widen * 1.6562525075872022e-05 + prob_narrow * -1.6240756328973555e-05
+        )
+    else:
+        expected_delta_spread = 0.0
+
+    return expected_delta_spread
 
 
 def simulate_prediction_accuracy(
-    instrument: str, period: str, exchange_latency: float, flipped: bool
+    instrument: str,
+    period: str,
+    exchange_latency: float,
+    window_size: int,
+    flipped: bool,
+    naive: bool,
 ):
-    sliding_upward_timestamps: list[float] = []
-    sliding_downward_timestamps: list[float] = []
+    sliding_timestamps: list[float] = []
+    sliding_timestamp_types: list[int] = []  # 0 = widen, 1 = narrow
     # pair of timestamp, predicted spread
     predictions_awaiting_matches: list[tuple[float, float]] = []
     total_predictions = 0
@@ -86,32 +106,31 @@ def simulate_prediction_accuracy(
                 predictions_awaiting_matches.remove((pred_timestamp, pred_spread))
 
             if last_spread is not None:
-                sliding_upward_timestamps = [
-                    t for t in sliding_upward_timestamps if timestamp - t <= 1
-                ]
-                sliding_downward_timestamps = [
-                    t for t in sliding_downward_timestamps if timestamp - t <= 1
-                ]
+                # only keep the newest window_size elements
+                sliding_timestamps = sliding_timestamps[-(window_size - 1) :]
+                sliding_timestamp_types = sliding_timestamp_types[-(window_size - 1) :]
 
+                sliding_timestamps.append(timestamp)
                 if spread > last_spread:
-                    sliding_upward_timestamps.append(timestamp)
+                    sliding_timestamp_types.append(0)
                 elif spread < last_spread:
-                    sliding_downward_timestamps.append(timestamp)
+                    sliding_timestamp_types.append(1)
+                else:
+                    sliding_timestamps.pop()  # no change, don't add
 
-                num_upward = len(sliding_upward_timestamps)
-                num_downward = len(sliding_downward_timestamps)
                 prediction_timestamp = timestamp + (exchange_latency / 1000)
 
-                timestamp_object = datetime.fromtimestamp(timestamp)
-
                 # make prediction
-                predicted_spread = predict_spread(
-                    current_spread=spread,
-                    recent_narrow_count=num_downward,
-                    recent_widen_count=num_upward,
-                    hour_of_day=timestamp_object.hour,
-                    projected_seconds=exchange_latency / 1000,
-                )
+                if not naive:
+                    predicted_delta_spread = predict_delta_spread(
+                        current_time=timestamp,
+                        event_timestamps=sliding_timestamps,
+                        event_types=sliding_timestamp_types,
+                        projected_seconds=exchange_latency / 1000,
+                    )
+                    predicted_spread = spread + predicted_delta_spread
+                else:
+                    predicted_spread = spread
                 # add it to pending predictions
                 predictions_awaiting_matches.append(
                     (prediction_timestamp, predicted_spread)
@@ -166,11 +185,22 @@ def main():
     parser.add_argument("instrument", type=str, help="Instrument identifier")
     parser.add_argument("period", type=str, help="Time period for prediction")
     parser.add_argument("exchange_latency", type=float, help="Exchange latency in ms")
+    parser.add_argument(
+        "window_size", type=int, help="Window size for sliding timestamps"
+    )
+    parser.add_argument(
+        "--naive", action="store_true", help="Use naive prediction (no Hawkes)"
+    )
     args = parser.parse_args()
 
     flipped = instrument_is_flipped(args.instrument, args.period)
     simulate_prediction_accuracy(
-        args.instrument, args.period, args.exchange_latency, flipped
+        args.instrument,
+        args.period,
+        args.exchange_latency,
+        args.window_size,
+        flipped,
+        args.naive,
     )
 
 

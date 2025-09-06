@@ -4,7 +4,7 @@ import csv
 from typing import Union
 
 
-file_suffix = "_july25"
+file_suffix = "_june25"
 
 
 def process(instrument: str, flipped: bool):
